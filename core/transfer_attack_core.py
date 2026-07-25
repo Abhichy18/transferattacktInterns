@@ -40,6 +40,7 @@ ALL_ATTACKS = [
     'IDAA',
     'DPA_HMA',
     'DYNAMIC_MORPH',
+    'MIG',
 ]
 
 ATTACK_COLS = {
@@ -62,6 +63,7 @@ ATTACK_COLS = {
     'IDAA': 'idaa_path',
     'DYNAMIC_MORPH': 'dynamic_morph_path',
     'DPA_HMA': 'dpa_hma_path',
+    'MIG': 'mig_path',
 }
 
 EPSILON = 0.062
@@ -1495,6 +1497,48 @@ def dynamic_morph_mi_fgsm(model, src, tgt, attack_type, input_size):
         
     return adv
 
+
+# Student-contributed attack integration:
+# MIG by Abhishek Choudhary
+# Paper basis: Transferable Adversarial Attack for Both Vision Transformers
+# and Convolutional Networks via Momentum Integrated Gradients (ICCV 2023)
+def mig_attack(model, x, tgt_emb, attack_type, s_factor=20):
+    adv = tf.identity(x)
+    g = tf.zeros_like(x)
+    alpha = EPSILON / NUM_ITER
+    tgt_emb = tf.nn.l2_normalize(tgt_emb, axis=1)
+
+    for _ in range(NUM_ITER):
+        with tf.GradientTape() as tape:
+            tape.watch(adv)
+            copies = []
+            for i in range(1, s_factor + 1):
+                interp = (float(i) / float(s_factor)) * adv
+                copies.append(interp)
+            batch = tf.concat(copies, axis=0)
+
+            emb = compute_embedding(model, batch)
+            tgt_rep = tf.repeat(tgt_emb, s_factor, axis=0)
+            cos = tf.reduce_sum(emb * tgt_rep, axis=1)
+            loss = attack_loss(cos, attack_type)
+
+        grad = tape.gradient(loss, adv)
+        if grad is None:
+            grad = tf.zeros_like(adv)
+        grad = tf.where(tf.math.is_finite(grad), grad, tf.zeros_like(grad))
+
+        # Integrated Gradient approximation
+        i_grad = adv * grad / float(s_factor)
+        grad_norm = i_grad / (tf.reduce_mean(tf.abs(i_grad)) + 1e-8)
+
+        g = DECAY * g + grad_norm
+        adv = adv + alpha * tf.sign(g)
+        adv = tf.clip_by_value(adv, x - EPSILON, x + EPSILON)
+        adv = tf.clip_by_value(adv, -1.0, 1.0)
+
+    return adv
+
+
 def build_attacker(model_name: str):
     return DeepFace.build_model(model_name).model
 
@@ -1540,6 +1584,8 @@ def run_attack(attack_name: str, model, src, tgt, attack_type: str, input_size):
         return dpa_hma(model, src, tgt_emb, attack_type)
     if attack_name == 'DYNAMIC_MORPH':
         return dynamic_morph_mi_fgsm(model, src, tgt, attack_type, input_size)
+    if attack_name == 'MIG':
+        return mig_attack(model, src, tgt_emb, attack_type)
     if attack_name == 'DPA_HMA_ENSEMBLE':
         raise ValueError(
             'DPA_HMA_ENSEMBLE requires dpa_hma_ensemble(...) with victim-specific '
